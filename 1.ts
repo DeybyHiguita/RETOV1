@@ -1,233 +1,173 @@
-Arquitecturó solución integral para spinner de carga automático
-Arquitecturó solución integral para spinner de carga automático
+Es un problema común con `MatSnackBar` — el botón de acción por defecto **no cierra automáticamente** la notificación, solo dispara un evento. Tienes que suscribirte a ese evento y cerrar manualmente.
 
-Vamos a crear un interceptor de carga global que muestre un spinner automáticamente en cada petición HTTP, sin que cada componente tenga que manejar su propio estado de cargando.
+## El problema en tu código actual
 
-Estructura
-src/app/core/
-├── services/
-│   └── loading.service.ts
-└── interceptors/
-    └── loading.interceptor.ts
+```typescript
+snackBar.open(mensaje, 'Cerrar', {
+  duration: 5000,
+  panelClass: ['snackbar-error']
+});
+```
 
-src/app/shared/
-└── spinner-global/
-    ├── spinner-global.component.ts
-    ├── spinner-global.component.html
-    └── spinner-global.component.scss
-1. Servicio de estado de carga
+`snackBar.open()` devuelve una referencia (`MatSnackBarRef`) que tiene un observable `onAction()` — si no te suscribes a él y llamas `.dismiss()`, el botón "Cerrar" solo se ve, pero no hace nada.
 
-Este servicio lleva la cuenta de cuántas peticiones están activas (importante, porque si tienes 3 llamadas simultáneas, no quieres que el spinner desaparezca cuando termine solo la primera).
+## Solución
 
-ng generate service core/services/loading
+## 1. Corregir el interceptor de errores
 
-Edita loading.service.ts:
-
-typescript
-import { Injectable } from '@angular/core';
-import { BehaviorSubject } from 'rxjs';
-
-@Injectable({ providedIn: 'root' })
-export class LoadingService {
-  private contadorPeticiones = 0;
-  private readonly cargandoSubject = new BehaviorSubject<boolean>(false);
-
-  cargando$ = this.cargandoSubject.asObservable();
-
-  mostrar(): void {
-    this.contadorPeticiones++;
-    this.cargandoSubject.next(true);
-  }
-
-  ocultar(): void {
-    this.contadorPeticiones = Math.max(0, this.contadorPeticiones - 1);
-
-    if (this.contadorPeticiones === 0) {
-      this.cargandoSubject.next(false);
-    }
-  }
-}
-2. Interceptor de carga
-ng generate interceptor core/interceptors/loading --functional
-
-Edita loading.interceptor.ts:
-
-typescript
-import { HttpInterceptorFn } from '@angular/common/http';
+```typescript
+import { HttpInterceptorFn, HttpErrorResponse } from '@angular/common/http';
 import { inject } from '@angular/core';
-import { finalize } from 'rxjs';
-import { LoadingService } from '../services/loading.service';
+import { MatSnackBar } from '@angular/material/snack-bar';
+import { catchError, throwError } from 'rxjs';
 
-export const loadingInterceptor: HttpInterceptorFn = (req, next) => {
-  const loadingService = inject(LoadingService);
-
-  loadingService.mostrar();
+export const errorInterceptor: HttpInterceptorFn = (req, next) => {
+  const snackBar = inject(MatSnackBar);
 
   return next(req).pipe(
-    finalize(() => loadingService.ocultar())
+    catchError((error: HttpErrorResponse) => {
+      const mensaje = obtenerMensajeError(error);
+
+      const snackBarRef = snackBar.open(mensaje, 'Cerrar', {
+        duration: 5000,
+        panelClass: ['snackbar-error']
+      });
+
+      // Cierra la notificación cuando se hace clic en "Cerrar"
+      snackBarRef.onAction().subscribe(() => {
+        snackBarRef.dismiss();
+      });
+
+      return throwError(() => error);
+    })
   );
 };
 
-finalize() es clave aquí: se ejecuta tanto si la petición tiene éxito como si falla, así el spinner siempre se oculta correctamente (a diferencia de poner la lógica dentro de next o catchError, donde podrías olvidar un caso).
-
-3. Componente del spinner global
-ng generate component shared/spinner-global --standalone
-
-Edita spinner-global.component.ts:
-
-typescript
-import { Component } from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { AsyncPipe } from '@angular/common';
-import { MatProgressBarModule } from '@angular/material/progress-bar';
-import { LoadingService } from '../../core/services/loading.service';
-
-@Component({
-  selector: 'app-spinner-global',
-  standalone: true,
-  imports: [CommonModule, AsyncPipe, MatProgressBarModule],
-  templateUrl: './spinner-global.component.html',
-  styleUrl: './spinner-global.component.scss'
-})
-export class SpinnerGlobalComponent {
-  constructor(public loadingService: LoadingService) {}
+function obtenerMensajeError(error: HttpErrorResponse): string {
+  // ... (mismo contenido que ya tenías)
 }
+```
 
-Edita spinner-global.component.html:
+## 2. Aplica lo mismo donde uses snackBar con botón de acción
 
-html
-<mat-progress-bar
-  *ngIf="loadingService.cargando$ | async"
-  mode="indeterminate"
-  class="barra-carga-global"
-></mat-progress-bar>
+En tus componentes (`ordenes-crear.component.ts`, `productos-crear.component.ts`), si el snackbar de éxito también tiene botón "Cerrar":
 
-Usé mat-progress-bar (una barra delgada arriba, estilo YouTube/Gmail) en vez de un mat-spinner circular, porque es menos intrusiva para un spinner "global" que aparece en cada llamada. Si prefieres el spinner circular centrado en pantalla, te muestro esa alternativa más abajo.
+```typescript
+const snackBarRef = this.snackBar.open('Orden creada exitosamente', 'Cerrar', { duration: 3000 });
+snackBarRef.onAction().subscribe(() => snackBarRef.dismiss());
+```
 
-Edita spinner-global.component.scss:
+## Alternativa más limpia: crear un servicio de notificaciones centralizado
 
-scss
-.barra-carga-global {
-  position: fixed;
-  top: 64px; // justo debajo de tu toolbar
-  left: 0;
-  right: 0;
-  z-index: 1000;
-  height: 3px;
-}
-4. Registrar el interceptor en app.config.ts
-typescript
-import { ApplicationConfig } from '@angular/core';
-import { provideRouter } from '@angular/router';
-import { provideHttpClient, withInterceptors } from '@angular/common/http';
-import { provideAnimations } from '@angular/platform-browser/animations';
-import { routes } from './app.routes';
-import { errorInterceptor } from './core/interceptors/error.interceptor';
-import { loadingInterceptor } from './core/interceptors/loading.interceptor';
+En vez de repetir el `.onAction().subscribe(...)` en cada lugar, mejor centralízalo. Esto también resuelve el problema de que tienes lógica de snackbar duplicada entre el interceptor y los componentes.
 
-export const appConfig: ApplicationConfig = {
-  providers: [
-    provideRouter(routes),
-    provideHttpClient(withInterceptors([loadingInterceptor, errorInterceptor])),
-    provideAnimations()
-  ]
-};
+```
+ng generate service core/services/notificacion
+```
 
-Orden importante: puse loadingInterceptor primero para que se active apenas sale la petición, y errorInterceptor después para que capture errores en el camino de vuelta. El orden de la lista define el orden de ejecución.
+Edita `notificacion.service.ts`:
 
-5. Agregar el spinner al layout principal
+```typescript
+import { Injectable } from '@angular/core';
+import { MatSnackBar } from '@angular/material/snack-bar';
 
-Edita layout-principal.component.ts para importar el spinner:
+@Injectable({ providedIn: 'root' })
+export class NotificacionService {
+  constructor(private snackBar: MatSnackBar) {}
 
-typescript
-import { SpinnerGlobalComponent } from '../../spinner-global/spinner-global.component';
-
-@Component({
-  selector: 'app-layout-principal',
-  standalone: true,
-  imports: [
-    CommonModule,
-    RouterOutlet,
-    RouterLink,
-    RouterLinkActive,
-    MatToolbarModule,
-    MatSidenavModule,
-    MatListModule,
-    MatIconModule,
-    MatButtonModule,
-    SpinnerGlobalComponent // <-- agregar
-  ],
-  templateUrl: './layout-principal.component.html',
-  styleUrl: './layout-principal.component.scss'
-})
-export class LayoutPrincipalComponent {
-  // ... mismo contenido
-}
-
-Edita layout-principal.component.html para incluirlo justo después del toolbar:
-
-html
-<mat-toolbar color="primary" class="toolbar-principal">
-  <button mat-icon-button (click)="alternarMenu()">
-    <mat-icon>menu</mat-icon>
-  </button>
-  <span class="titulo-app">Plataforma de Órdenes</span>
-</mat-toolbar>
-
-<app-spinner-global></app-spinner-global>
-
-<mat-sidenav-container class="contenedor-principal">
-  <!-- resto igual -->
-</mat-sidenav-container>
-6. Simplificar tus componentes (ya no necesitas la variable cargando local)
-
-Ahora que el spinner es global, puedes simplificar ordenes-crear.component.ts:
-
-typescript
-enviar(): void {
-  if (this.formulario.invalid) {
-    this.formulario.markAllAsTouched();
-    return;
+  mostrarExito(mensaje: string): void {
+    this.mostrar(mensaje, ['snackbar-exito']);
   }
 
-  this.ordenesService.crear(this.formulario.value as any).subscribe({
-    next: (respuesta) => {
-      this.ordenCreada = respuesta;
-      this.formulario.reset();
-      this.snackBar.open('Orden creada exitosamente', 'Cerrar', { duration: 3000 });
-    },
-    error: () => {
-      // El interceptor de error ya notificó, y el de loading ya ocultó el spinner
-    }
-  });
+  mostrarError(mensaje: string): void {
+    this.mostrar(mensaje, ['snackbar-error']);
+  }
+
+  private mostrar(mensaje: string, clases: string[]): void {
+    const snackBarRef = this.snackBar.open(mensaje, 'Cerrar', {
+      duration: 5000,
+      panelClass: clases
+    });
+
+    snackBarRef.onAction().subscribe(() => snackBarRef.dismiss());
+  }
+}
+```
+
+Ahora tu interceptor queda más simple:
+
+```typescript
+import { HttpInterceptorFn, HttpErrorResponse } from '@angular/common/http';
+import { inject } from '@angular/core';
+import { catchError, throwError } from 'rxjs';
+import { NotificacionService } from '../services/notificacion.service';
+
+export const errorInterceptor: HttpInterceptorFn = (req, next) => {
+  const notificacionService = inject(NotificacionService);
+
+  return next(req).pipe(
+    catchError((error: HttpErrorResponse) => {
+      const mensaje = obtenerMensajeError(error);
+      notificacionService.mostrarError(mensaje);
+      return throwError(() => error);
+    })
+  );
+};
+
+function obtenerMensajeError(error: HttpErrorResponse): string {
+  // ... (mismo contenido)
+}
+```
+
+Y en tus componentes:
+
+```typescript
+this.ordenesService.crear(this.formulario.value as any).subscribe({
+  next: (respuesta) => {
+    this.ordenCreada = respuesta;
+    this.formulario.reset();
+    this.notificacionService.mostrarExito('Orden creada exitosamente');
+  },
+  error: () => {
+    // El interceptor ya notificó el error
+  }
+});
+```
+
+No olvides inyectar el nuevo servicio en el constructor en vez de `MatSnackBar` directamente:
+
+```typescript
+constructor(
+  private fb: FormBuilder,
+  private ordenesService: OrdenesService,
+  private notificacionService: NotificacionService
+) {}
+```
+
+## 3. Agregar el estilo de éxito (si no lo tienes)
+
+En `styles.scss` global:
+
+```scss
+.snackbar-error {
+  background-color: #d32f2f !important;
+  color: white !important;
+
+  .mat-mdc-snack-bar-label {
+    color: white !important;
+  }
 }
 
-Puedes quitar cargando = false/true y el [disabled]="cargando" del botón si prefieres depender solo del spinner global — aunque yo mantendría el disabled del botón para evitar doble clic mientras la petición está en curso (eso sigue siendo responsabilidad del componente, no del interceptor).
+.snackbar-exito {
+  background-color: #388e3c !important;
+  color: white !important;
 
-Alternativa: spinner circular centrado (si prefieres esto en vez de la barra superior)
-
-Si te gusta más un spinner circular con fondo semitransparente cubriendo la pantalla:
-
-html
-<div class="overlay-carga" *ngIf="loadingService.cargando$ | async">
-  <mat-spinner diameter="50"></mat-spinner>
-</div>
-scss
-.overlay-carga {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.2);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
+  .mat-mdc-snack-bar-label {
+    color: white !important;
+  }
 }
+```
 
-(Recuerda cambiar el import de MatProgressBarModule a MatProgressSpinnerModule si usas esta versión.)
+---
 
-7. Probar
-ng serve
-
-Al hacer cualquier petición (crear orden, listar productos), deberías ver la barra de progreso aparecer arriba y desaparecer cuando termina.
-
-¿Prefieres la barra delgada arriba o el spinner circular centrado? ¿O te funcionó bien la que armamos y seguimos con otra parte de la guía?
+Con el servicio centralizado, el botón "Cerrar" ahora sí cierra la notificación, y de paso eliminas la duplicación de lógica de snackbar entre el interceptor y los componentes. ¿Quieres que migremos también el snackbar de `productos-crear.component.ts` a este nuevo servicio?
