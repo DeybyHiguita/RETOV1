@@ -1,318 +1,508 @@
-Vamos con la actividad práctica del **Día 4** — programación funcional aplicada al dominio. La idea central: funciones que no modifican estado externo, siempre devuelven lo mismo dado el mismo input, y se pueden combinar entre sí.
+Perfecto, vamos a integrar `Categoria` como campo real y completo en todo el flujo: dominio (ya lo hicimos), DTOs, EF Core, caso de uso, controlador, y Angular.
 
-## 1. Objeto de valor: OrdenId (te faltaba este)
+## 1. DTOs — agregar Categoria
 
-Ya tienes `Dinero` y `CantidadProducto`, pero el `Id` de `Orden` sigue siendo un `Guid` suelto. Vamos a encapsularlo como Value Object — es una práctica común para evitar "obsesión primitiva" (usar tipos primitivos donde deberías tener un concepto de dominio).
-
-`Ordenes.Dominio/ObjetosDeValor/OrdenId.cs`:
+`DTOs/Producto/CrearProductoRequest.cs`:
 
 ```csharp
-namespace Ordenes.Dominio.ObjetosDeValor;
+namespace Ordenes.Aplicacion.DTOs;
 
-public sealed record OrdenId
-{
-    public Guid Valor { get; }
-
-    private OrdenId(Guid valor)
-    {
-        Valor = valor;
-    }
-
-    public static OrdenId Nuevo() => new(Guid.NewGuid());
-
-    public static OrdenId Desde(Guid valor)
-    {
-        if (valor == Guid.Empty)
-        {
-            throw new Excepciones.ExcepcionDominio("El identificador de la orden no puede estar vacío.");
-        }
-
-        return new OrdenId(valor);
-    }
-
-    public override string ToString() => Valor.ToString();
-}
+public record CrearProductoRequest(string Nombre, decimal Precio, int StockInicial, string Categoria);
 ```
 
-**Nota:** No voy a forzar el cambio de `Orden.Id` de `Guid` a `OrdenId` ahora mismo porque eso implica tocar EF Core (configuración, migraciones) y todos los DTOs — es un cambio grande para solo una actividad práctica. Lo dejamos disponible como Value Object aprendido; si quieres migrarlo en serio después, lo hacemos con cuidado.
-
-## 2. Agregar Categoria a Producto (necesario para "agrupar por categoría")
-
-Tu `Producto` actual no tiene categoría. Vamos a agregarla mínimamente.
-
-En `Producto.cs`, agrega la propiedad y ajusta el método `Crear`:
+`DTOs/Producto/ProductoResponse.cs`:
 
 ```csharp
-public sealed class Producto
-{
-    public Guid Id { get; }
-    public string Nombre { get; private set; }
-    public Dinero Precio { get; private set; }
-    public int Stock { get; private set; }
-    public string Categoria { get; private set; }
+namespace Ordenes.Aplicacion.DTOs;
 
-    private Producto(Guid id, string nombre, Dinero precio, int stock, string categoria)
-    {
-        Id = id;
-        Nombre = nombre;
-        Precio = precio;
-        Stock = stock;
-        Categoria = categoria;
-    }
-
-    public static Producto Crear(string nombre, decimal precio, int stockInicial, string categoria)
-    {
-        if (string.IsNullOrWhiteSpace(nombre))
-        {
-            throw new ExcepcionDominio("El nombre del producto es obligatorio.");
-        }
-
-        if (string.IsNullOrWhiteSpace(categoria))
-        {
-            throw new ExcepcionDominio("La categoría del producto es obligatoria.");
-        }
-
-        if (stockInicial < 0)
-        {
-            throw new ExcepcionDominio("El stock inicial no puede ser negativo.");
-        }
-
-        return new Producto(Guid.NewGuid(), nombre.Trim(), Dinero.Crear(precio), stockInicial, categoria.Trim());
-    }
-
-    public bool EstaDisponible => Stock > 0;
-
-    // ... resto de métodos igual (DescontarStock, ActualizarStock, ActualizarDatos)
-}
+public record ProductoResponse(Guid Id, string Nombre, decimal Precio, int Stock, string Categoria);
 ```
 
-Esto implica: actualizar `CrearProductoRequest`, `ProductoResponse`, `ProductoConfiguracion` (EF), el caso de uso `CrearProducto`, y crear una migración. Te lo dejo al final como checklist, para enfocarnos primero en las funciones puras que pediste.
-
-## 3. Funciones puras: cálculo de totales, filtrado, agrupación
-
-Creamos una clase estática con funciones puras — no dependen de estado externo, no tienen efectos secundarios, y siempre devuelven lo mismo dado el mismo input.
-
-`Ordenes.Dominio/Funcional/OperacionesOrden.cs`:
+`DTOs/Producto/ActualizarProductoRequest.cs` (si ya lo tienes del módulo de edición):
 
 ```csharp
-using Ordenes.Dominio.Entidades;
-using Ordenes.Dominio.ObjetosDeValor;
+namespace Ordenes.Aplicacion.DTOs;
 
-namespace Ordenes.Dominio.Funcional;
-
-public static class OperacionesOrden
-{
-    /// <summary>
-    /// Calcula el total de una orden a partir de sus ítems, usando una función pura (Aggregate).
-    /// No modifica ningún estado externo; siempre devuelve el mismo resultado para los mismos ítems.
-    /// </summary>
-    public static Dinero CalcularTotal(IEnumerable<ItemOrden> items)
-    {
-        return items.Aggregate(
-            Dinero.Cero,
-            (total, item) => total.Sumar(item.CalcularSubtotal()));
-    }
-}
+public record ActualizarProductoRequest(string Nombre, decimal Precio, int Stock, string Categoria);
 ```
 
-`Ordenes.Dominio/Funcional/OperacionesProducto.cs`:
+## 2. Configuración EF Core
+
+`Persistencia/Configuraciones/ProductoConfiguracion.cs`:
 
 ```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
 using Ordenes.Dominio.Entidades;
 
-namespace Ordenes.Dominio.Funcional;
+namespace Ordenes.Infraestructura.Persistencia.Configuraciones;
 
-public static class OperacionesProducto
+public class ProductoConfiguracion : IEntityTypeConfiguration<Producto>
 {
-    /// <summary>
-    /// Filtra productos disponibles (con stock mayor a cero).
-    /// Función pura: no modifica la colección original, devuelve una nueva.
-    /// </summary>
-    public static IEnumerable<Producto> FiltrarDisponibles(IEnumerable<Producto> productos)
+    public void Configure(EntityTypeBuilder<Producto> builder)
     {
-        return productos.Where(producto => producto.EstaDisponible);
-    }
+        builder.ToTable("Productos");
 
-    /// <summary>
-    /// Agrupa productos por categoría.
-    /// Función pura: devuelve una nueva estructura de agrupación sin efectos secundarios.
-    /// </summary>
-    public static IReadOnlyDictionary<string, List<Producto>> AgruparPorCategoria(IEnumerable<Producto> productos)
-    {
-        return productos
-            .GroupBy(producto => producto.Categoria)
-            .ToDictionary(grupo => grupo.Key, grupo => grupo.ToList());
+        builder.HasKey(producto => producto.Id);
+
+        builder.Property(producto => producto.Id)
+            .ValueGeneratedNever();
+
+        builder.Property(producto => producto.Nombre)
+            .IsRequired()
+            .HasMaxLength(200);
+
+        builder.Property(producto => producto.Stock)
+            .IsRequired();
+
+        builder.Property(producto => producto.Categoria)
+            .IsRequired()
+            .HasMaxLength(100);
+
+        builder.HasIndex(producto => producto.Categoria); // útil para filtrar/agrupar por categoría en consultas
+
+        builder.OwnsOne(producto => producto.Precio, precio =>
+        {
+            precio.Property(p => p.Monto)
+                .HasColumnName("Precio")
+                .HasColumnType("decimal(18,2)")
+                .IsRequired();
+        });
     }
 }
 ```
 
-## 4. Descuentos mediante funciones componibles
+## 3. Caso de uso CrearProducto
 
-Aquí está la parte más "funcional" de la actividad: representar un descuento como una **función** (`Func<Dinero, Dinero>`), y poder **combinar varias** en secuencia sin que ninguna dependa de estado externo.
-
-`Ordenes.Dominio/Funcional/Descuentos.cs`:
+`CasosDeUso/CrearProducto.cs`:
 
 ```csharp
-using Ordenes.Dominio.ObjetosDeValor;
-
-namespace Ordenes.Dominio.Funcional;
-
-public static class Descuentos
-{
-    /// <summary>
-    /// Descuento de un porcentaje fijo (ej. 0.10 = 10%).
-    /// Devuelve una función pura: Dinero -> Dinero.
-    /// </summary>
-    public static Func<Dinero, Dinero> PorcentajeFijo(decimal porcentaje)
-    {
-        return dinero => Dinero.Crear(dinero.Monto - (dinero.Monto * porcentaje));
-    }
-
-    /// <summary>
-    /// Descuento de un monto fijo, sin dejar el total en negativo.
-    /// </summary>
-    public static Func<Dinero, Dinero> MontoFijo(decimal monto)
-    {
-        return dinero => Dinero.Crear(Math.Max(0, dinero.Monto - monto));
-    }
-
-    /// <summary>
-    /// Compone varias funciones de descuento en una sola, aplicándolas en orden.
-    /// Esto es "funciones componibles": cada descuento es independiente,
-    /// y se pueden encadenar sin que ninguna conozca a las demás.
-    /// </summary>
-    public static Func<Dinero, Dinero> Componer(params Func<Dinero, Dinero>[] descuentos)
-    {
-        return dinero => descuentos.Aggregate(dinero, (acumulado, descuento) => descuento(acumulado));
-    }
-}
-```
-
-## 5. Cómo se usarían juntas (ejemplo de uso, no necesariamente producción)
-
-```csharp
-var total = OperacionesOrden.CalcularTotal(orden.Items);
-
-var descuentoCompuesto = Descuentos.Componer(
-    Descuentos.PorcentajeFijo(0.10m),   // 10% de descuento
-    Descuentos.MontoFijo(5.00m));        // luego resta 5 unidades monetarias fijas
-
-var totalConDescuento = descuentoCompuesto(total);
-```
-
-Esto demuestra justo lo que pide el Día 4: **"aplicar descuentos mediante funciones componibles"** — cada descuento es una función independiente y pura; `Componer` las encadena sin que se conozcan entre sí, y puedes agregar/quitar descuentos sin tocar la lógica de los demás.
-
-## 6. Pruebas unitarias de estas funciones (para validar que son puras)
-
-`Ordenes.PruebasUnitarias/Funcional/OperacionesProductoPruebas.cs`:
-
-```csharp
+using Ordenes.Aplicacion.DTOs;
+using Ordenes.Aplicacion.Interfaces;
+using Ordenes.Aplicacion.Resultados;
 using Ordenes.Dominio.Entidades;
-using Ordenes.Dominio.Funcional;
-using Xunit;
+using Ordenes.Dominio.Excepciones;
 
-namespace Ordenes.PruebasUnitarias.Funcional;
+namespace Ordenes.Aplicacion.CasosDeUso;
 
-public class OperacionesProductoPruebas
+public class CrearProducto
 {
-    [Fact]
-    public void DebeFiltrarSoloProductosConStockDisponible()
+    private readonly IRepositorioProductos _repositorioProductos;
+
+    public CrearProducto(IRepositorioProductos repositorioProductos)
     {
-        var productos = new List<Producto>
-        {
-            Producto.Crear("Teclado", 50, 10, "Periféricos"),
-            Producto.Crear("Mouse", 20, 0, "Periféricos"),
-            Producto.Crear("Monitor", 300, 5, "Pantallas")
-        };
-
-        var disponibles = OperacionesProducto.FiltrarDisponibles(productos).ToList();
-
-        Assert.Equal(2, disponibles.Count);
-        Assert.DoesNotContain(disponibles, p => p.Nombre == "Mouse");
+        _repositorioProductos = repositorioProductos;
     }
 
-    [Fact]
-    public void DebeAgruparProductosPorCategoria()
+    public async Task<Resultado<ProductoResponse>> EjecutarAsync(
+        CrearProductoRequest request,
+        CancellationToken cancellationToken = default)
     {
-        var productos = new List<Producto>
+        try
         {
-            Producto.Crear("Teclado", 50, 10, "Periféricos"),
-            Producto.Crear("Mouse", 20, 5, "Periféricos"),
-            Producto.Crear("Monitor", 300, 5, "Pantallas")
-        };
+            var producto = Producto.Crear(request.Nombre, request.Precio, request.StockInicial, request.Categoria);
 
-        var agrupados = OperacionesProducto.AgruparPorCategoria(productos);
+            await _repositorioProductos.GuardarAsync(producto, cancellationToken);
 
-        Assert.Equal(2, agrupados["Periféricos"].Count);
-        Assert.Single(agrupados["Pantallas"]);
+            return Resultado.Exito(MapearAResponse(producto));
+        }
+        catch (ExcepcionDominio ex)
+        {
+            return Resultado.Fallo<ProductoResponse>(Error.Validacion(ex.Message));
+        }
     }
+
+    private static ProductoResponse MapearAResponse(Producto producto) =>
+        new(producto.Id, producto.Nombre, producto.Precio.Monto, producto.Stock, producto.Categoria);
 }
 ```
 
-`Ordenes.PruebasUnitarias/Funcional/DescuentosPruebas.cs`:
+Nota: si ya tenías un `ProductoMapeador` centralizado (como hicimos con `OrdenMapeador`), es mejor moverlo ahí. Te lo dejo abajo como mejora.
+
+## 4. Crear el mapeador centralizado de Producto (si no lo tienes ya)
+
+`Mapeadores/ProductoMapeador.cs`:
 
 ```csharp
-using Ordenes.Dominio.Funcional;
-using Ordenes.Dominio.ObjetosDeValor;
-using Xunit;
+using Ordenes.Aplicacion.DTOs;
+using Ordenes.Dominio.Entidades;
 
-namespace Ordenes.PruebasUnitarias.Funcional;
+namespace Ordenes.Aplicacion.Mapeadores;
 
-public class DescuentosPruebas
+public static class ProductoMapeador
 {
-    [Fact]
-    public void DebeAplicarDescuentoPorcentualCorrectamente()
+    public static ProductoResponse AResponse(Producto producto) =>
+        new(producto.Id, producto.Nombre, producto.Precio.Monto, producto.Stock, producto.Categoria);
+}
+```
+
+Y así, todos tus casos de uso de Producto (`CrearProducto`, `ConsultarProductos`, `ConsultarProductoPorId`, `ActualizarProducto`) usan `ProductoMapeador.AResponse(producto)` en vez de repetir el mapeo. Actualízalos:
+
+```csharp
+// En cada caso de uso, reemplaza el mapeo manual por:
+using Ordenes.Aplicacion.Mapeadores;
+// ...
+return Resultado.Exito(ProductoMapeador.AResponse(producto));
+```
+
+## 5. Actualizar ActualizarProducto (dominio + caso de uso)
+
+Ya que `ActualizarDatos` en el dominio solo tocaba nombre/precio, agrégale categoría:
+
+`Producto.cs`:
+
+```csharp
+public void ActualizarDatos(string nombre, decimal precio, string categoria)
+{
+    if (string.IsNullOrWhiteSpace(nombre))
     {
-        var dinero = Dinero.Crear(100);
-        var descuento = Descuentos.PorcentajeFijo(0.10m);
-
-        var resultado = descuento(dinero);
-
-        Assert.Equal(90, resultado.Monto);
+        throw new ExcepcionDominio("El nombre del producto es obligatorio.");
     }
 
-    [Fact]
-    public void DebeComponerVariosDescuentosEnOrden()
+    if (string.IsNullOrWhiteSpace(categoria))
     {
-        var dinero = Dinero.Crear(100);
-
-        var compuesto = Descuentos.Componer(
-            Descuentos.PorcentajeFijo(0.10m), // 100 -> 90
-            Descuentos.MontoFijo(5m));         // 90 -> 85
-
-        var resultado = compuesto(dinero);
-
-        Assert.Equal(85, resultado.Monto);
+        throw new ExcepcionDominio("La categoría del producto es obligatoria.");
     }
 
-    [Fact]
-    public void NoDebeDejarMontoNegativoConDescuentoFijo()
+    Nombre = nombre.Trim();
+    Precio = Dinero.Crear(precio);
+    Categoria = categoria.Trim();
+}
+```
+
+`CasosDeUso/ActualizarProducto.cs`:
+
+```csharp
+public async Task<Resultado<ProductoResponse>> EjecutarAsync(
+    Guid id,
+    ActualizarProductoRequest request,
+    CancellationToken cancellationToken = default)
+{
+    var producto = await _repositorioProductos.ObtenerPorIdAsync(id, cancellationToken);
+
+    if (producto is null)
     {
-        var dinero = Dinero.Crear(3);
-        var descuento = Descuentos.MontoFijo(10m);
+        return Resultado.Fallo<ProductoResponse>(
+            Error.NoEncontrado($"No se encontró el producto con id {id}."));
+    }
 
-        var resultado = descuento(dinero);
+    try
+    {
+        producto.ActualizarDatos(request.Nombre, request.Precio, request.Categoria);
+        producto.ActualizarStock(request.Stock);
 
-        Assert.Equal(0, resultado.Monto);
+        await _repositorioProductos.ActualizarAsync(producto, cancellationToken);
+
+        return Resultado.Exito(ProductoMapeador.AResponse(producto));
+    }
+    catch (ExcepcionDominio ex)
+    {
+        return Resultado.Fallo<ProductoResponse>(Error.Validacion(ex.Message));
     }
 }
 ```
 
-## Checklist para integrar `Categoria` de verdad al proyecto (opcional, si quieres llevarlo a producción)
+## 6. Crear la migración
 
-Si decides que `Categoria` sea un campo real y no solo para esta práctica:
+En la Consola del Administrador de Paquetes:
 
-1. Agregar `Categoria` a `CrearProductoRequest` y `ProductoResponse`
-2. Actualizar `ProductoConfiguracion.cs` con `builder.Property(p => p.Categoria).IsRequired().HasMaxLength(100)`
-3. Actualizar `CrearProducto` caso de uso para pasar la categoría
-4. Actualizar el formulario Angular (`productos-formulario`) con un campo de categoría (podrías usar `MatSelect` con categorías predefinidas)
-5. Crear migración: `Add-Migration AgregarCategoriaProducto`
+```
+Add-Migration AgregarCategoriaProducto -Project Ordenes.Infraestructura -StartupProject Ordenes.Api
+Update-Database -Project Ordenes.Infraestructura -StartupProject Ordenes.Api
+```
 
-## Preguntas de validación del Día 4 (para verificar que quedó claro)
+**Importante:** si ya tienes productos guardados en tu base de datos de pruebas, esta migración va a fallar porque `Categoria` es `IsRequired()` sin valor por defecto para las filas existentes. Dos opciones:
 
-- **¿Qué hace que una función sea pura?** → `CalcularTotal`, `FiltrarDisponibles` y las funciones de `Descuentos` no modifican nada externo, no dependen de variables globales, y siempre devuelven el mismo resultado dado el mismo input.
-- **¿Cuándo usarías `record` en C#?** → Ya lo haces en `Dinero`, `CantidadProducto`, `OrdenId` — cuando el objeto representa un valor (no una identidad) y quieres igualdad estructural e inmutabilidad por defecto.
-- **¿Qué ventaja tiene LINQ frente a ciclos imperativos?** → `Where`, `GroupBy`, `Aggregate` expresan **qué** quieres (el resultado), no **cómo** iterar paso a paso — son más declarativos, más cortos, y menos propensos a errores de estado mutable.
-- **¿Cuándo una excepción no debería usarse para controlar flujo de negocio?** → Ya lo resolviste con el Result pattern: en vez de lanzar excepciones para "descuento inválido", una función pura como `MontoFijo` simplemente devuelve `0` como piso, sin lanzar nada.
+**Opción A (recomendada para desarrollo):** borra la base de datos y vuelve a crearla desde cero:
+```
+Drop-Database -Project Ordenes.Infraestructura -StartupProject Ordenes.Api
+Update-Database -Project Ordenes.Infraestructura -StartupProject Ordenes.Api
+```
 
-¿Quieres que integremos `Categoria` de verdad al proyecto (migración incluida), o seguimos con el Día 11 (FluentValidation, CORS, health checks)?
+**Opción B:** si quieres conservar los datos, edita la migración generada para darle un valor por defecto temporal:
+```csharp
+migrationBuilder.AddColumn<string>(
+    name: "Categoria",
+    table: "Productos",
+    type: "nvarchar(100)",
+    maxLength: 100,
+    nullable: false,
+    defaultValue: "Sin categoría"); // <-- agrega esto
+```
+
+## 7. Angular — modelo actualizado
+
+`producto.model.ts`:
+
+```typescript
+export interface CrearProductoRequest {
+  nombre: string;
+  precio: number;
+  stockInicial: number;
+  categoria: string;
+}
+
+export interface ActualizarProductoRequest {
+  nombre: string;
+  precio: number;
+  stock: number;
+  categoria: string;
+}
+
+export interface ProductoResponse {
+  id: string;
+  nombre: string;
+  precio: number;
+  stock: number;
+  categoria: string;
+}
+```
+
+## 8. Angular — categorías predefinidas (constante reutilizable)
+
+`core/models/categorias-producto.ts`:
+
+```typescript
+export const CATEGORIAS_PRODUCTO: string[] = [
+  'Periféricos',
+  'Pantallas',
+  'Componentes',
+  'Audio',
+  'Redes',
+  'Almacenamiento',
+  'Otros'
+];
+```
+
+## 9. Actualizar el formulario Angular con MatSelect
+
+`productos-formulario.component.ts`:
+
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ReactiveFormsModule, FormBuilder, Validators } from '@angular/forms';
+import { ActivatedRoute, Router } from '@angular/router';
+import { ProductosService } from '../../../core/services/productos.service';
+import { NotificacionService } from '../../../core/services/notificacion.service';
+import { CATEGORIAS_PRODUCTO } from '../../../core/models/categorias-producto';
+
+import { MatFormFieldModule } from '@angular/material/form-field';
+import { MatInputModule } from '@angular/material/input';
+import { MatSelectModule } from '@angular/material/select';
+import { MatButtonModule } from '@angular/material/button';
+import { MatCardModule } from '@angular/material/card';
+
+@Component({
+  selector: 'app-productos-formulario',
+  standalone: true,
+  imports: [
+    CommonModule,
+    ReactiveFormsModule,
+    MatFormFieldModule,
+    MatInputModule,
+    MatSelectModule,
+    MatButtonModule,
+    MatCardModule
+  ],
+  templateUrl: './productos-formulario.component.html',
+  styleUrl: './productos-formulario.component.scss'
+})
+export class ProductosFormularioComponent implements OnInit {
+  modoEdicion = false;
+  productoId: string | null = null;
+  categorias = CATEGORIAS_PRODUCTO;
+
+  formulario = this.fb.group({
+    nombre: ['', Validators.required],
+    precio: [0, [Validators.required, Validators.min(0.01)]],
+    stock: [0, [Validators.required, Validators.min(0)]],
+    categoria: ['', Validators.required]
+  });
+
+  constructor(
+    private fb: FormBuilder,
+    private productosService: ProductosService,
+    private notificacionService: NotificacionService,
+    private route: ActivatedRoute,
+    private router: Router
+  ) {}
+
+  ngOnInit(): void {
+    this.productoId = this.route.snapshot.paramMap.get('id');
+    this.modoEdicion = !!this.productoId;
+
+    if (this.modoEdicion && this.productoId) {
+      this.cargarProducto(this.productoId);
+    }
+  }
+
+  private cargarProducto(id: string): void {
+    this.productosService.obtenerPorId(id).subscribe({
+      next: (producto) => {
+        this.formulario.patchValue({
+          nombre: producto.nombre,
+          precio: producto.precio,
+          stock: producto.stock,
+          categoria: producto.categoria
+        });
+      },
+      error: () => {
+        this.notificacionService.mostrarError('No se pudo cargar el producto.');
+        this.router.navigate(['/productos/lista']);
+      }
+    });
+  }
+
+  enviar(): void {
+    if (this.formulario.invalid) {
+      this.formulario.markAllAsTouched();
+      return;
+    }
+
+    if (this.modoEdicion && this.productoId) {
+      this.actualizar(this.productoId);
+    } else {
+      this.crear();
+    }
+  }
+
+  private crear(): void {
+    const valores = this.formulario.value;
+
+    this.productosService.crear({
+      nombre: valores.nombre!,
+      precio: valores.precio!,
+      stockInicial: valores.stock!,
+      categoria: valores.categoria!
+    }).subscribe({
+      next: () => {
+        this.notificacionService.mostrarExito('Producto creado exitosamente');
+        this.router.navigate(['/productos/lista']);
+      },
+      error: () => {}
+    });
+  }
+
+  private actualizar(id: string): void {
+    const valores = this.formulario.value;
+
+    this.productosService.actualizar(id, {
+      nombre: valores.nombre!,
+      precio: valores.precio!,
+      stock: valores.stock!,
+      categoria: valores.categoria!
+    }).subscribe({
+      next: () => {
+        this.notificacionService.mostrarExito('Producto actualizado exitosamente');
+        this.router.navigate(['/productos/lista']);
+      },
+      error: () => {}
+    });
+  }
+}
+```
+
+## 10. HTML del formulario con MatSelect
+
+`productos-formulario.component.html`:
+
+```html
+<mat-card>
+  <mat-card-header>
+    <mat-card-title>{{ modoEdicion ? 'Editar Producto' : 'Crear Producto' }}</mat-card-title>
+  </mat-card-header>
+
+  <mat-card-content>
+    <form [formGroup]="formulario" (ngSubmit)="enviar()">
+      <mat-form-field appearance="outline" style="width: 100%">
+        <mat-label>Nombre</mat-label>
+        <input matInput formControlName="nombre" />
+      </mat-form-field>
+
+      <mat-form-field appearance="outline" style="width: 100%">
+        <mat-label>Categoría</mat-label>
+        <mat-select formControlName="categoria">
+          <mat-option *ngFor="let categoria of categorias" [value]="categoria">
+            {{ categoria }}
+          </mat-option>
+        </mat-select>
+      </mat-form-field>
+
+      <mat-form-field appearance="outline" style="width: 100%">
+        <mat-label>Precio</mat-label>
+        <input matInput type="number" formControlName="precio" />
+      </mat-form-field>
+
+      <mat-form-field appearance="outline" style="width: 100%">
+        <mat-label>{{ modoEdicion ? 'Stock' : 'Stock inicial' }}</mat-label>
+        <input matInput type="number" formControlName="stock" />
+      </mat-form-field>
+
+      <button mat-raised-button color="primary" type="submit">
+        {{ modoEdicion ? 'Guardar cambios' : 'Crear Producto' }}
+      </button>
+    </form>
+  </mat-card-content>
+</mat-card>
+```
+
+## 11. Actualizar la tabla de listado para mostrar Categoría
+
+`productos-lista.component.ts`:
+
+```typescript
+columnas: string[] = ['nombre', 'categoria', 'precio', 'stock', 'acciones'];
+```
+
+`productos-lista.component.html`:
+
+```html
+<ng-container matColumnDef="categoria">
+  <th mat-header-cell *matHeaderCellDef>Categoría</th>
+  <td mat-cell *matCellDef="let producto">{{ producto.categoria }}</td>
+</ng-container>
+```
+
+(Agrégalo entre la columna `nombre` y `precio` en el HTML.)
+
+## 12. Actualizar tus pruebas unitarias existentes de Producto
+
+En `CrearProductoPruebas.cs`, ajusta las llamadas para incluir categoría:
+
+```csharp
+[Fact]
+public async Task DebeCrearProductoCorrectamente()
+{
+    var request = new CrearProductoRequest("Teclado mecánico", 89.90m, 50, "Periféricos");
+
+    var resultado = await _crearProducto.EjecutarAsync(request);
+
+    Assert.True(resultado.EsExitoso);
+    Assert.Equal("Periféricos", resultado.Valor!.Categoria);
+}
+
+[Fact]
+public async Task DebeFallarSiCategoriaEsVacia()
+{
+    var request = new CrearProductoRequest("Teclado", 89.90m, 50, "");
+
+    var resultado = await _crearProducto.EjecutarAsync(request);
+
+    Assert.False(resultado.EsExitoso);
+}
+```
+
+## 13. Compilar y probar todo
+
+1. `Ctrl+Shift+B` en Visual Studio
+2. `Add-Migration` + `Update-Database` (o `Drop-Database` si prefieres empezar limpio)
+3. `F5` para correr la API
+4. `ng serve` para Angular
+5. Ve a `/productos/crear`, ahora debería aparecer el selector de categoría
+6. Crea un producto, verifica que aparece en el listado con su categoría
+7. Edítalo y confirma que la categoría se precarga y se puede cambiar
+
+---
+
+¿Compiló todo bien y la migración se aplicó sin problema, o te encontraste algún error en el camino?
