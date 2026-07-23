@@ -1,448 +1,318 @@
-Excelente pregunta de seguridad — y la respuesta corta es: **actualmente NO lo tienes cubierto del todo**. Tienes una defensa parcial (tu Result pattern), pero hay un hueco real. Te explico el porqué y después lo cerramos.
+Vamos con la actividad práctica del **Día 4** — programación funcional aplicada al dominio. La idea central: funciones que no modifican estado externo, siempre devuelven lo mismo dado el mismo input, y se pueden combinar entre sí.
 
-## Por qué no se debe mostrar un stack trace al consumidor
+## 1. Objeto de valor: OrdenId (te faltaba este)
 
-Un stack trace expone información interna que un atacante puede usar:
+Ya tienes `Dinero` y `CantidadProducto`, pero el `Id` de `Orden` sigue siendo un `Guid` suelto. Vamos a encapsularlo como Value Object — es una práctica común para evitar "obsesión primitiva" (usar tipos primitivos donde deberías tener un concepto de dominio).
 
-**1. Revela tu estructura de código**
-```
-System.NullReferenceException: Object reference not set...
-   at Ordenes.Infraestructura.Persistencia.RepositorioOrdenesEfCore.ObtenerPorIdAsync(...)
-   at Ordenes.Aplicacion.CasosDeUso.ConsultarOrdenPorId.EjecutarAsync(...)
-```
-Un atacante ahora sabe nombres exactos de clases, métodos, namespaces — literalmente el mapa de tu arquitectura interna.
-
-**2. Puede revelar la tecnología y versión exacta**
-```
-at Microsoft.EntityFrameworkCore.SqlServer, Version=8.0.1.0...
-```
-Si existe una vulnerabilidad conocida (CVE) para esa versión específica de EF Core o de una librería, el atacante ya sabe exactamente qué exploit probar.
-
-**3. Puede filtrar información de la base de datos**
-```
-Microsoft.Data.SqlClient.SqlException: Invalid column name 'PrecioUnitario2'.
-```
-Esto revela nombres de columnas/tablas reales — información que ayuda a construir un ataque de SQL Injection dirigido, o simplemente entender tu modelo de datos sin permiso.
-
-**4. Puede revelar rutas del servidor**
-```
-at C:\ProyectosPublicados\PlataformaOrdenes\Infraestructura\...
-```
-Rutas de archivos del servidor de producción — información que no debería salir nunca de tu infraestructura.
-
-**5. Rompe el contrato de la API (conectando con lo que vimos del Día 1)**
-Un consumidor de tu API (Angular, un tercero) no debería recibir un error con forma impredecible. El contrato dice: "los errores tienen esta forma estándar" (tu `ProblemDetails`). Un stack trace crudo rompe esa promesa.
-
-## ¿Ya lo hacen ustedes? — Diagnóstico real de tu proyecto
-
-Tienes **dos categorías de errores**, y solo una está bien protegida:
-
-### ✅ Errores de negocio conocidos (SÍ están protegidos)
-
-Cuando lanzas `ExcepcionDominio` y la capturas en el caso de uso:
+`Ordenes.Dominio/ObjetosDeValor/OrdenId.cs`:
 
 ```csharp
-catch (ExcepcionDominio ex)
+namespace Ordenes.Dominio.ObjetosDeValor;
+
+public sealed record OrdenId
 {
-    return Resultado.Fallo<OrdenResponse>(Error.Validacion(ex.Message));
-}
-```
+    public Guid Valor { get; }
 
-Esto nunca llega a exponer un stack trace — tu `ManejarResultado` devuelve un `ProblemDetails` limpio y controlado. ✅ Bien.
-
-### ❌ Errores NO controlados (NO están protegidos todavía)
-
-¿Qué pasa si ocurre algo que **no** es una `ExcepcionDominio`? Por ejemplo:
-- La base de datos está caída (`SqlException`)
-- Un `NullReferenceException` por un bug
-- Timeout de red
-
-Ninguno de tus `try/catch` actuales captura esto — solo capturas `ExcepcionDominio` específicamente. Esa excepción **no controlada** sigue su curso hacia arriba, y en ASP.NET Core:
-
-- **En ambiente Development** (que es donde probablemente estás probando ahora mismo): ASP.NET Core activa automáticamente una página de excepción detallada que **sí muestra el stack trace completo** en la respuesta.
-- **En ambiente Production**: por defecto ASP.NET Core sí oculta el detalle, pero solo si está bien configurado — y devuelve un 500 genérico sin `ProblemDetails` consistente con el resto de tu API (rompe el contrato igual, aunque no filtre información).
-
-## La solución: middleware global de excepciones (el pendiente real del Día 11)
-
-Vamos a capturar **cualquier excepción no controlada** en un solo lugar, para que nunca llegue a exponerse un stack trace, sin importar qué falle.
-
-### 1. Crear el middleware
-
-`Ordenes.Api/Middlewares/ManejadorExcepcionesMiddleware.cs`:
-
-```csharp
-using Microsoft.AspNetCore.Mvc;
-using System.Text.Json;
-
-namespace Ordenes.Api.Middlewares;
-
-public class ManejadorExcepcionesMiddleware
-{
-    private readonly RequestDelegate _siguiente;
-    private readonly ILogger<ManejadorExcepcionesMiddleware> _logger;
-    private readonly IWebHostEnvironment _entorno;
-
-    public ManejadorExcepcionesMiddleware(
-        RequestDelegate siguiente,
-        ILogger<ManejadorExcepcionesMiddleware> logger,
-        IWebHostEnvironment entorno)
+    private OrdenId(Guid valor)
     {
-        _siguiente = siguiente;
-        _logger = logger;
-        _entorno = entorno;
+        Valor = valor;
     }
 
-    public async Task InvokeAsync(HttpContext contexto)
+    public static OrdenId Nuevo() => new(Guid.NewGuid());
+
+    public static OrdenId Desde(Guid valor)
     {
-        try
+        if (valor == Guid.Empty)
         {
-            await _siguiente(contexto);
+            throw new Excepciones.ExcepcionDominio("El identificador de la orden no puede estar vacío.");
         }
-        catch (Exception ex)
+
+        return new OrdenId(valor);
+    }
+
+    public override string ToString() => Valor.ToString();
+}
+```
+
+**Nota:** No voy a forzar el cambio de `Orden.Id` de `Guid` a `OrdenId` ahora mismo porque eso implica tocar EF Core (configuración, migraciones) y todos los DTOs — es un cambio grande para solo una actividad práctica. Lo dejamos disponible como Value Object aprendido; si quieres migrarlo en serio después, lo hacemos con cuidado.
+
+## 2. Agregar Categoria a Producto (necesario para "agrupar por categoría")
+
+Tu `Producto` actual no tiene categoría. Vamos a agregarla mínimamente.
+
+En `Producto.cs`, agrega la propiedad y ajusta el método `Crear`:
+
+```csharp
+public sealed class Producto
+{
+    public Guid Id { get; }
+    public string Nombre { get; private set; }
+    public Dinero Precio { get; private set; }
+    public int Stock { get; private set; }
+    public string Categoria { get; private set; }
+
+    private Producto(Guid id, string nombre, Dinero precio, int stock, string categoria)
+    {
+        Id = id;
+        Nombre = nombre;
+        Precio = precio;
+        Stock = stock;
+        Categoria = categoria;
+    }
+
+    public static Producto Crear(string nombre, decimal precio, int stockInicial, string categoria)
+    {
+        if (string.IsNullOrWhiteSpace(nombre))
         {
-            // El stack trace SÍ se registra en logs internos (para que tú lo veas)
-            _logger.LogError(ex, "Error no controlado procesando {Metodo} {Ruta}",
-                contexto.Request.Method, contexto.Request.Path);
-
-            contexto.Response.ContentType = "application/problem+json";
-            contexto.Response.StatusCode = StatusCodes.Status500InternalServerError;
-
-            var problemDetails = new ProblemDetails
-            {
-                Title = "Error Interno del Servidor",
-                Status = StatusCodes.Status500InternalServerError,
-                // Solo mostramos el detalle real en Development, nunca en Production
-                Detail = _entorno.IsDevelopment()
-                    ? ex.ToString()
-                    : "Ocurrió un error inesperado. Contacta al administrador si el problema persiste."
-            };
-
-            var json = JsonSerializer.Serialize(problemDetails);
-            await contexto.Response.WriteAsync(json);
+            throw new ExcepcionDominio("El nombre del producto es obligatorio.");
         }
+
+        if (string.IsNullOrWhiteSpace(categoria))
+        {
+            throw new ExcepcionDominio("La categoría del producto es obligatoria.");
+        }
+
+        if (stockInicial < 0)
+        {
+            throw new ExcepcionDominio("El stock inicial no puede ser negativo.");
+        }
+
+        return new Producto(Guid.NewGuid(), nombre.Trim(), Dinero.Crear(precio), stockInicial, categoria.Trim());
     }
+
+    public bool EstaDisponible => Stock > 0;
+
+    // ... resto de métodos igual (DescontarStock, ActualizarStock, ActualizarDatos)
 }
 ```
 
-**Punto clave:** el stack trace real (`ex.ToString()`) **sí se guarda en tus logs** (`_logger.LogError`), donde tú como desarrollador lo necesitas para diagnosticar. Solo se **oculta al consumidor externo** de la API. Esa es la distinción importante: no pierdes información para depurar, solo dejas de filtrarla hacia afuera.
+Esto implica: actualizar `CrearProductoRequest`, `ProductoResponse`, `ProductoConfiguracion` (EF), el caso de uso `CrearProducto`, y crear una migración. Te lo dejo al final como checklist, para enfocarnos primero en las funciones puras que pediste.
 
-### 2. Registrar el middleware en Program.cs
+## 3. Funciones puras: cálculo de totales, filtrado, agrupación
 
-Debe ir **lo más arriba posible** en el pipeline, para capturar errores de todo lo que viene después:
+Creamos una clase estática con funciones puras — no dependen de estado externo, no tienen efectos secundarios, y siempre devuelven lo mismo dado el mismo input.
 
-```csharp
-var app = builder.Build();
-
-app.UseMiddleware<ManejadorExcepcionesMiddleware>(); // <-- primero que todo
-
-app.UsarSwaggerPersonalizado();
-app.UseHttpsRedirection();
-app.UseCors("PermitirAngular");
-app.UseAuthorization();
-app.MapControllers();
-
-app.Run();
-```
-
-### 3. Probar que funciona
-
-Para verificarlo rápido, provoca un error no controlado a propósito. Por ejemplo, temporalmente en algún endpoint:
+`Ordenes.Dominio/Funcional/OperacionesOrden.cs`:
 
 ```csharp
-[HttpGet("probar-error")]
-public IActionResult ProbarError()
+using Ordenes.Dominio.Entidades;
+using Ordenes.Dominio.ObjetosDeValor;
+
+namespace Ordenes.Dominio.Funcional;
+
+public static class OperacionesOrden
 {
-    throw new InvalidOperationException("Error de prueba simulado");
-}
-```
-
-Pruébalo en Swagger — deberías recibir:
-
-```json
-{
-  "title": "Error Interno del Servidor",
-  "status": 500,
-  "detail": "Ocurrió un error inesperado. Contacta al administrador si el problema persiste."
-}
-```
-
-En vez del stack trace completo. Borra el endpoint de prueba después.
-
-## Respuesta directa a tu pregunta
-
-**¿Ya lo hacemos?** Parcialmente — tus errores de negocio (`ExcepcionDominio`) sí están protegidos gracias al Result pattern. **¿Debemos hacerlo?** Sí, para el resto: cualquier fallo inesperado (base de datos caída, bugs, excepciones de librerías externas) todavía puede filtrar información sensible si no agregas este middleware.
-
-¿Compiló bien el middleware y viste el `ProblemDetails` genérico al forzar el error de prueba?
-
-Son tres controles de seguridad distintos que suelen confundirse porque los tres "protegen" tu API, pero cada uno responde una pregunta diferente y actúa en un momento distinto del flujo. Te lo explico con ejemplos exactos de tu proyecto.
-
-## Las tres preguntas que responde cada uno
-
-| Concepto | Pregunta que responde |
-|---|---|
-| **Validación** | ¿Estos datos tienen la forma/reglas correctas? |
-| **Sanitización** | ¿Estos datos son seguros de usar/mostrar tal cual vienen? |
-| **Autorización** | ¿Esta persona tiene permiso de hacer esto? |
-
-## 1. Validación — "¿Los datos son correctos?"
-
-Verifica que los datos cumplan reglas de formato y de negocio, **sin importar quién los envía**.
-
-Ya la tienes por todos lados en tu proyecto:
-
-```csharp
-// Validación de formato/rango (Value Objects del dominio)
-public static CantidadProducto Crear(int valor)
-{
-    if (valor <= 0)
+    /// <summary>
+    /// Calcula el total de una orden a partir de sus ítems, usando una función pura (Aggregate).
+    /// No modifica ningún estado externo; siempre devuelve el mismo resultado para los mismos ítems.
+    /// </summary>
+    public static Dinero CalcularTotal(IEnumerable<ItemOrden> items)
     {
-        throw new ExcepcionDominio("La cantidad debe ser mayor a cero.");
+        return items.Aggregate(
+            Dinero.Cero,
+            (total, item) => total.Sumar(item.CalcularSubtotal()));
     }
-    return new CantidadProducto(valor);
 }
 ```
 
-```csharp
-// Validación de regla de negocio
-if (listaItems.Count == 0)
-{
-    throw new ExcepcionDominio("La orden debe tener al menos un producto.");
-}
-```
-
-**Responde:** "¿Cantidad = -5 tiene sentido? No, rechazado." "¿Una orden sin ítems es válida? No, rechazada."
-
-**Nunca modifica el dato** — solo lo acepta o lo rechaza.
-
-## 2. Sanitización — "¿Es seguro usar/mostrar este dato tal cual?"
-
-Limpia o neutraliza contenido potencialmente peligroso **antes de usarlo o mostrarlo**, incluso si "técnicamente" es un dato válido en formato.
-
-Ejemplo con tu `Producto.Nombre`:
+`Ordenes.Dominio/Funcional/OperacionesProducto.cs`:
 
 ```csharp
-public static Producto Crear(string nombre, decimal precio, int stockInicial)
+using Ordenes.Dominio.Entidades;
+
+namespace Ordenes.Dominio.Funcional;
+
+public static class OperacionesProducto
 {
-    if (string.IsNullOrWhiteSpace(nombre))
+    /// <summary>
+    /// Filtra productos disponibles (con stock mayor a cero).
+    /// Función pura: no modifica la colección original, devuelve una nueva.
+    /// </summary>
+    public static IEnumerable<Producto> FiltrarDisponibles(IEnumerable<Producto> productos)
     {
-        throw new ExcepcionDominio("El nombre del producto es obligatorio.");
+        return productos.Where(producto => producto.EstaDisponible);
     }
-    return new Producto(Guid.NewGuid(), nombre.Trim(), ...);
+
+    /// <summary>
+    /// Agrupa productos por categoría.
+    /// Función pura: devuelve una nueva estructura de agrupación sin efectos secundarios.
+    /// </summary>
+    public static IReadOnlyDictionary<string, List<Producto>> AgruparPorCategoria(IEnumerable<Producto> productos)
+    {
+        return productos
+            .GroupBy(producto => producto.Categoria)
+            .ToDictionary(grupo => grupo.Key, grupo => grupo.ToList());
+    }
 }
 ```
 
-`nombre.Trim()` es una sanitización mínima (quita espacios). Pero imagina que alguien envía como nombre:
+## 4. Descuentos mediante funciones componibles
 
-```
-<script>alert('hackeado')</script>
-```
+Aquí está la parte más "funcional" de la actividad: representar un descuento como una **función** (`Func<Dinero, Dinero>`), y poder **combinar varias** en secuencia sin que ninguna dependa de estado externo.
 
-Esto **pasa tu validación actual** sin problema (no está vacío, es texto válido). El dato es "válido" en forma, pero **peligroso** si Angular luego lo muestra directamente en el HTML sin escaparlo — ahí es donde ocurre un **XSS** (Cross-Site Scripting), justo lo que menciona el Día 2 de tu plan.
-
-**La sanitización correcta acá tiene dos capas:**
-
-- **Backend:** podrías rechazar o limpiar caracteres HTML peligrosos del nombre antes de guardarlo
-- **Frontend (la más importante):** Angular **ya sanitiza automáticamente** por defecto cuando usas interpolación normal:
-```html
-<td mat-cell *matCellDef="let producto">{{ producto.nombre }}</td>
-```
-Angular escapa esto automáticamente — no ejecuta el `<script>`, lo muestra como texto plano. **El riesgo aparece si alguien usa `[innerHTML]` sin cuidado:**
-```html
-<!-- ⚠️ Peligroso si el dato no está sanitizado -->
-<div [innerHTML]="producto.nombre"></div>
-```
-Esto sí ejecutaría el script. Por eso el Día 2 de tu plan pregunta: *"¿Por qué Angular no debe confiar en datos provenientes del backend sin validación?"* — la respuesta es exactamente esta.
-
-**Diferencia clave con validación:** la validación **rechaza** datos malos; la sanitización **transforma/neutraliza** datos que técnicamente "pasan" pero son riesgosos en otro contexto (HTML, SQL, sistema de archivos).
-
-## 3. Autorización — "¿Esta persona puede hacer esto?"
-
-No se trata de si el dato es correcto — se trata de **quién** está pidiendo la acción y si tiene permiso, **incluso con datos perfectamente válidos**.
-
-Ejemplo futuro en tu proyecto (Día 12, JWT):
+`Ordenes.Dominio/Funcional/Descuentos.cs`:
 
 ```csharp
-[Authorize(Roles = "Admin")]
-[HttpDelete("{id}")]
-public async Task<ActionResult> Eliminar(Guid id)
+using Ordenes.Dominio.ObjetosDeValor;
+
+namespace Ordenes.Dominio.Funcional;
+
+public static class Descuentos
 {
-    // Solo un Admin puede llegar aquí, sin importar si el id es válido
+    /// <summary>
+    /// Descuento de un porcentaje fijo (ej. 0.10 = 10%).
+    /// Devuelve una función pura: Dinero -> Dinero.
+    /// </summary>
+    public static Func<Dinero, Dinero> PorcentajeFijo(decimal porcentaje)
+    {
+        return dinero => Dinero.Crear(dinero.Monto - (dinero.Monto * porcentaje));
+    }
+
+    /// <summary>
+    /// Descuento de un monto fijo, sin dejar el total en negativo.
+    /// </summary>
+    public static Func<Dinero, Dinero> MontoFijo(decimal monto)
+    {
+        return dinero => Dinero.Crear(Math.Max(0, dinero.Monto - monto));
+    }
+
+    /// <summary>
+    /// Compone varias funciones de descuento en una sola, aplicándolas en orden.
+    /// Esto es "funciones componibles": cada descuento es independiente,
+    /// y se pueden encadenar sin que ninguna conozca a las demás.
+    /// </summary>
+    public static Func<Dinero, Dinero> Componer(params Func<Dinero, Dinero>[] descuentos)
+    {
+        return dinero => descuentos.Aggregate(dinero, (acumulado, descuento) => descuento(acumulado));
+    }
 }
 ```
 
-Aquí el `id` puede ser perfectamente válido (existe, tiene formato correcto), pero si quien hace la petición es un `Viewer` en vez de un `Admin`, la petición se rechaza **antes** de que le importe si el dato es válido o no.
-
-**Autenticación vs Autorización** (para no mezclar un cuarto concepto):
-- **Autenticación:** ¿sabemos quién eres? (login, JWT válido)
-- **Autorización:** ya sabiendo quién eres, ¿tienes permiso para *esto*? (rol, política)
-
-## Cómo se relacionan los tres en un solo request (orden típico)
-
-Imagina: `PUT /api/v1/Productos/{id}` con body `{ "nombre": "<script>...</script>", "precio": -10 }`, enviado por un usuario con rol `Viewer`.
-
-```
-1. Autorización   → ¿Viewer puede actualizar productos? NO → 403 Forbidden (ni siquiera llega a validar el body)
-
-   (si fuera Admin, continuaría:)
-
-2. Validación     → ¿precio = -10 es válido? NO → 400 Bad Request (Error.Validacion)
-
-   (si el precio fuera válido:)
-
-3. Sanitización   → ¿el nombre con <script> es seguro de guardar/mostrar? 
-                     Se neutraliza o se rechaza antes de persistir/renderizar
-```
-
-El orden real más común es: **Autorización primero** (no vale la pena procesar nada si no tiene permiso), luego **Validación** (¿la forma del dato tiene sentido?), y la **Sanitización** ocurre tanto al guardar como, especialmente, al mostrar el dato de vuelta.
-
-## Resumen en una frase para cada uno
-
-- **Validación:** "Este dato no cumple las reglas, lo rechazo." (`ExcepcionDominio`, `Result.Fallo`)
-- **Sanitización:** "Este dato cumple las reglas, pero podría ser peligroso — lo limpio o lo trato con cuidado antes de usarlo." (Angular interpolation, evitar `innerHTML` sin control)
-- **Autorización:** "No importa si el dato es válido — esta persona no tiene permiso para hacer esto." (`[Authorize(Roles = "...")]`, próximo Día 12)
-
-¿Quieres que revisemos ahora mismo si `Producto.Nombre` u `Orden` tienen algún campo de texto libre donde valga la pena agregar una sanitización más estricta antes de seguir con JWT (Día 12)?
-
-Dos preguntas del Día 2 de tu plan, y ambas se conectan directamente con código que ya tienes. Vamos una por una.
-
-## 1. Cómo ayuda Entity Framework a prevenir SQL Injection
-
-## Qué es SQL Injection (el problema que resuelve)
-
-Ocurre cuando un dato que viene del usuario se concatena directamente dentro de una consulta SQL como texto, sin separarlo del código. Ejemplo de lo que **NUNCA** se debe hacer (SQL crudo concatenado):
+## 5. Cómo se usarían juntas (ejemplo de uso, no necesariamente producción)
 
 ```csharp
-// ❌ VULNERABLE — nunca hagas esto
-var sql = $"SELECT * FROM Productos WHERE Nombre = '{nombreBuscado}'";
+var total = OperacionesOrden.CalcularTotal(orden.Items);
+
+var descuentoCompuesto = Descuentos.Componer(
+    Descuentos.PorcentajeFijo(0.10m),   // 10% de descuento
+    Descuentos.MontoFijo(5.00m));        // luego resta 5 unidades monetarias fijas
+
+var totalConDescuento = descuentoCompuesto(total);
 ```
 
-Si alguien envía como `nombreBuscado`:
-```
-' OR '1'='1
-```
+Esto demuestra justo lo que pide el Día 4: **"aplicar descuentos mediante funciones componibles"** — cada descuento es una función independiente y pura; `Componer` las encadena sin que se conozcan entre sí, y puedes agregar/quitar descuentos sin tocar la lógica de los demás.
 
-La consulta se convierte en:
-```sql
-SELECT * FROM Productos WHERE Nombre = '' OR '1'='1'
-```
+## 6. Pruebas unitarias de estas funciones (para validar que son puras)
 
-Eso devuelve **todos** los productos, ignorando el filtro — y con variantes más agresivas (`'; DROP TABLE Productos; --`), un atacante puede borrar tablas completas o extraer datos que no debería ver.
-
-## Cómo EF Core te protege de esto automáticamente
-
-Tu código ya usa **LINQ**, nunca SQL concatenado a mano:
+`Ordenes.PruebasUnitarias/Funcional/OperacionesProductoPruebas.cs`:
 
 ```csharp
-public async Task<Producto?> ObtenerPorIdAsync(Guid id, CancellationToken cancellationToken = default)
+using Ordenes.Dominio.Entidades;
+using Ordenes.Dominio.Funcional;
+using Xunit;
+
+namespace Ordenes.PruebasUnitarias.Funcional;
+
+public class OperacionesProductoPruebas
 {
-    return await _contexto.Productos
-        .FirstOrDefaultAsync(producto => producto.Id == id, cancellationToken);
+    [Fact]
+    public void DebeFiltrarSoloProductosConStockDisponible()
+    {
+        var productos = new List<Producto>
+        {
+            Producto.Crear("Teclado", 50, 10, "Periféricos"),
+            Producto.Crear("Mouse", 20, 0, "Periféricos"),
+            Producto.Crear("Monitor", 300, 5, "Pantallas")
+        };
+
+        var disponibles = OperacionesProducto.FiltrarDisponibles(productos).ToList();
+
+        Assert.Equal(2, disponibles.Count);
+        Assert.DoesNotContain(disponibles, p => p.Nombre == "Mouse");
+    }
+
+    [Fact]
+    public void DebeAgruparProductosPorCategoria()
+    {
+        var productos = new List<Producto>
+        {
+            Producto.Crear("Teclado", 50, 10, "Periféricos"),
+            Producto.Crear("Mouse", 20, 5, "Periféricos"),
+            Producto.Crear("Monitor", 300, 5, "Pantallas")
+        };
+
+        var agrupados = OperacionesProducto.AgruparPorCategoria(productos);
+
+        Assert.Equal(2, agrupados["Periféricos"].Count);
+        Assert.Single(agrupados["Pantallas"]);
+    }
 }
 ```
 
-Cuando EF Core traduce esto a SQL real, **no concatena el valor de `id` como texto** — lo envía como un **parámetro separado**:
-
-```sql
-SELECT TOP(1) [p].[Id], [p].[Nombre], ...
-FROM [Productos] AS [p]
-WHERE [p].[Id] = @__id_0
-```
-
-`@__id_0` es un parámetro real de SQL Server, enviado por separado del texto de la consulta. El motor de base de datos sabe con certeza: "esto es un **valor de dato**, no código SQL ejecutable" — sin importar qué texto contenga. Aunque `id` contuviera algo como `'; DROP TABLE Productos; --`, SQL Server lo trataría como un simple valor de texto a comparar, nunca como instrucción.
-
-## Dónde SÍ podrías romper esta protección (para que sepas qué evitar)
-
-EF Core te protege **mientras uses LINQ**. Si alguna vez usas SQL crudo con `FromSqlRaw` concatenando strings, vuelves a estar expuesto:
+`Ordenes.PruebasUnitarias/Funcional/DescuentosPruebas.cs`:
 
 ```csharp
-// ❌ Esto SÍ sería vulnerable, incluso usando EF Core
-_contexto.Productos.FromSqlRaw($"SELECT * FROM Productos WHERE Nombre = '{nombreBuscado}'");
-```
+using Ordenes.Dominio.Funcional;
+using Ordenes.Dominio.ObjetosDeValor;
+using Xunit;
 
-```csharp
-// ✅ Esto es seguro (parametrizado correctamente)
-_contexto.Productos.FromSqlInterpolated($"SELECT * FROM Productos WHERE Nombre = {nombreBuscado}");
-```
+namespace Ordenes.PruebasUnitarias.Funcional;
 
-`FromSqlInterpolated` (con la sintaxis `$"..."`) sí parametriza automáticamente, a diferencia de `FromSqlRaw` con concatenación manual.
-
-**Tu proyecto está seguro ahora mismo** porque nunca has usado SQL crudo — todo pasa por LINQ (`Where`, `FirstOrDefaultAsync`, etc.), que siempre parametriza.
-
----
-
-## 2. Por qué Angular no debe confiar en datos de la API sin validarlos
-
-Esto conecta con lo que hablamos de sanitización, pero aquí el ángulo es distinto: no es sobre datos que **envías** a la API, sino sobre datos que **recibes** de ella.
-
-## La idea errónea común
-
-"Si el dato ya pasó por mi backend con Clean Architecture, dominio validado, EF Core parametrizado... ¿por qué no confiar en lo que me devuelve?"
-
-## Por qué esa confianza es un error, con 3 razones concretas
-
-**Razón 1: El backend no es la única fuente de la verdad para Angular**
-
-Angular no sabe (ni debería asumir) que **siempre** habla con tu API real. Podría estar hablando con:
-- Un backend comprometido (si alguien vulneró tu servidor)
-- Un proxy intermedio modificado
-- Un ataque de tipo Man-in-the-Middle si HTTPS estuviera mal configurado
-- Datos corruptos por un bug en tu propio backend
-
-Angular no puede verificar "confío ciegamente en que este JSON es 100% seguro" solo porque viene de una URL que tú controlas.
-
-**Razón 2: Datos válidos en tu dominio no son automáticamente seguros para el DOM**
-
-Aquí está la conexión directa con lo que vimos de sanitización. Imagina este escenario real en tu proyecto:
-
-```csharp
-// Tu backend valida esto correctamente como "válido"
-public static Producto Crear(string nombre, decimal precio, int stockInicial)
+public class DescuentosPruebas
 {
-    if (string.IsNullOrWhiteSpace(nombre)) { throw ... }
-    return new Producto(Guid.NewGuid(), nombre.Trim(), ...);
+    [Fact]
+    public void DebeAplicarDescuentoPorcentualCorrectamente()
+    {
+        var dinero = Dinero.Crear(100);
+        var descuento = Descuentos.PorcentajeFijo(0.10m);
+
+        var resultado = descuento(dinero);
+
+        Assert.Equal(90, resultado.Monto);
+    }
+
+    [Fact]
+    public void DebeComponerVariosDescuentosEnOrden()
+    {
+        var dinero = Dinero.Crear(100);
+
+        var compuesto = Descuentos.Componer(
+            Descuentos.PorcentajeFijo(0.10m), // 100 -> 90
+            Descuentos.MontoFijo(5m));         // 90 -> 85
+
+        var resultado = compuesto(dinero);
+
+        Assert.Equal(85, resultado.Monto);
+    }
+
+    [Fact]
+    public void NoDebeDejarMontoNegativoConDescuentoFijo()
+    {
+        var dinero = Dinero.Crear(3);
+        var descuento = Descuentos.MontoFijo(10m);
+
+        var resultado = descuento(dinero);
+
+        Assert.Equal(0, resultado.Monto);
+    }
 }
 ```
 
-`nombre = "<img src=x onerror=alert('hackeado')>"` **pasa perfectamente** esta validación — no está vacío, es texto válido. Tu backend lo guarda sin problema, y se lo devuelve a Angular tal cual en `ProductoResponse`.
+## Checklist para integrar `Categoria` de verdad al proyecto (opcional, si quieres llevarlo a producción)
 
-**El backend hizo su trabajo correctamente** (validó que hubiera un nombre). Pero ese nombre, al llegar a Angular, sigue siendo peligroso **si Angular lo trata sin cuidado**:
+Si decides que `Categoria` sea un campo real y no solo para esta práctica:
 
-```html
-<!-- ❌ Peligroso: si en algún componente usas esto -->
-<div [innerHTML]="producto.nombre"></div>
-```
+1. Agregar `Categoria` a `CrearProductoRequest` y `ProductoResponse`
+2. Actualizar `ProductoConfiguracion.cs` con `builder.Property(p => p.Categoria).IsRequired().HasMaxLength(100)`
+3. Actualizar `CrearProducto` caso de uso para pasar la categoría
+4. Actualizar el formulario Angular (`productos-formulario`) con un campo de categoría (podrías usar `MatSelect` con categorías predefinidas)
+5. Crear migración: `Add-Migration AgregarCategoriaProducto`
 
-Esto ejecutaría el `onerror` y correría JavaScript arbitrario en el navegador de quien esté viendo esa pantalla — un ataque **XSS almacenado** (porque el dato malicioso quedó guardado en tu base de datos, esperando a que alguien lo visualice).
+## Preguntas de validación del Día 4 (para verificar que quedó claro)
 
-**Razón 3: Angular no controla qué pasó "en el camino"**
+- **¿Qué hace que una función sea pura?** → `CalcularTotal`, `FiltrarDisponibles` y las funciones de `Descuentos` no modifican nada externo, no dependen de variables globales, y siempre devuelven el mismo resultado dado el mismo input.
+- **¿Cuándo usarías `record` en C#?** → Ya lo haces en `Dinero`, `CantidadProducto`, `OrdenId` — cuando el objeto representa un valor (no una identidad) y quieres igualdad estructural e inmutabilidad por defecto.
+- **¿Qué ventaja tiene LINQ frente a ciclos imperativos?** → `Where`, `GroupBy`, `Aggregate` expresan **qué** quieres (el resultado), no **cómo** iterar paso a paso — son más declarativos, más cortos, y menos propensos a errores de estado mutable.
+- **¿Cuándo una excepción no debería usarse para controlar flujo de negocio?** → Ya lo resolviste con el Result pattern: en vez de lanzar excepciones para "descuento inválido", una función pura como `MontoFijo` simplemente devuelve `0` como piso, sin lanzar nada.
 
-Aunque confíes 100% en tu propio backend hoy, mañana:
-- Alguien agrega un nuevo endpoint sin las mismas validaciones
-- Un compañero de equipo escribe una consulta que no pasa por el dominio
-- Se integra un tercero que también escribe a la misma base de datos
-
-Angular, como capa de presentación, **no puede asumir** que todos esos caminos futuros siempre validaron correctamente.
-
-## Cómo Angular se protege en la práctica (lo que ya tienes, y lo que deberías reforzar)
-
-**Ya te protege por defecto (interpolación estándar):**
-```html
-{{ producto.nombre }}
-```
-Angular **siempre** escapa esto automáticamente — convierte `<script>` en texto plano visible, nunca lo ejecuta. Esta es tu defensa principal, y ya la usas en tus tablas (`productos-lista.component.html`, `ordenes-lista.component.html`).
-
-**El peligro real solo aparece si usas explícitamente:**
-```html
-[innerHTML]="algo"
-[innerText] no es peligroso, pero [innerHTML] sí, si el contenido no está sanitizado
-bypassSecurityTrustHtml(...) — esto le dice a Angular "confía en esto ciegamente", úsalo solo si tú mismo generaste el HTML, nunca con datos externos
-```
-
-**Revisemos tu proyecto:** en ningún componente que hemos creado hasta ahora (`productos-lista`, `ordenes-lista`, formularios) usaste `[innerHTML]` — todo usa interpolación `{{ }}` normal. Estás bien protegido en este punto actual del proyecto. ✅
-
-## Resumen de ambas respuestas
-
-- **EF Core previene SQL Injection** porque traduce LINQ a SQL parametrizado automáticamente — el dato del usuario nunca se mezcla como código ejecutable con la consulta, siempre y cuando no uses `FromSqlRaw` con concatenación manual.
-- **Angular no debe confiar en datos de la API** porque "válido según las reglas de negocio" no es lo mismo que "seguro de insertar directamente en el DOM" — la validación del backend y la sanitización del frontend resuelven problemas distintos, y Angular necesita su propia defensa (que ya tiene por defecto con interpolación, mientras evites `[innerHTML]` sin control).
-
-¿Quieres que revisemos juntos si en algún punto futuro del proyecto (por ejemplo, si agregas una vista de "detalle de producto" más elaborada) valdría la pena usar `[innerHTML]` con `DomSanitizer` para permitir texto enriquecido controlado (ej. descripciones con negritas), o prefieres seguir con el Día 11 (FluentValidation, CORS, health checks)?
+¿Quieres que integremos `Categoria` de verdad al proyecto (migración incluida), o seguimos con el Día 11 (FluentValidation, CORS, health checks)?
